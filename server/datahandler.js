@@ -1,4 +1,5 @@
 /* Libraries / Imports */
+const dns = require('dns');
 const fs = require('fs');
 const https = require('https');
 const koffi = require('koffi');
@@ -7,8 +8,11 @@ const os = require('os');
 const platform = os.platform();
 const cpuArchitecture = os.arch();
 const { configName, serverConfig, configUpdate, configSave } = require('./server_config');
+const { logInfo, logError, logWarn } = require('./console');
 let unicode_type;
 let shared_Library;
+let internetConnectionOn = false;
+let internetConnectionOff = false;
 
 if (platform === 'win32') {
   unicode_type = 'int16_t';
@@ -109,7 +113,8 @@ const callbacks = {
   ), 'callback_af*'),
 
   ecc: koffi.register(rds => (
-    value = rdsparser.get_ecc(rds)
+    value = rdsparser.get_ecc(rds),
+    dataToSend.ecc = value
   ), 'callback_ecc*'),
 
   country: koffi.register(rds => (
@@ -200,24 +205,25 @@ const decode_errors = function(string) {
 };
 
 const updateInterval = 75;
-const clientUpdateIntervals = new Map(); // Store update intervals for each client
 
 // Initialize the data object
 var dataToSend = {
   pi: '?',
   freq: 87.500.toFixed(3),
-  previousFreq: 87.500.toFixed(3),
-  signal: 0,
-  highestSignal: -Infinity,
+  prevFreq: 87.500.toFixed(3),
+  sig: 0,
+  sigRaw: '',
+  sigTop: -Infinity,
   bw: 0,
   st: false,
-  st_forced: false,
+  stForced: false,
   rds: false,
   ps: '',
   tp: 0,
   ta: 0,
   ms: -1,
   pty: 0,
+  ecc: null,
   af: [],
   rt0: '',
   rt1: '',
@@ -225,13 +231,16 @@ var dataToSend = {
   eq: 0,
   ant: 0,
   txInfo: {
-    station: '',
+    tx: '',
     pol: '',
     erp: '',
     city: '',
     itu: '',
-    distance: '',
-    azimuth: ''
+    dist: '',
+    azi: '',
+    id: '',
+    reg: false,
+    pi: '',
   },
   country_name: '',
   country_iso: 'UN',
@@ -247,13 +256,18 @@ const filterMappings = {
 
 
 var legacyRdsPiBuffer = null;
+var lastUpdateTime = Date.now();
 const initialData = { ...dataToSend };
 const resetToDefault = dataToSend => Object.assign(dataToSend, initialData);
 
+// Serialport reconnect variables
+const ServerStartTime = process.hrtime();
+var serialportUpdateTime = process.hrtime();
+let checkSerialport = false;
 
-function handleData(ws, receivedData) {
+
+function handleData(wss, receivedData, rdsWss) {
   // Retrieve the last update time for this client
-  let lastUpdateTime = clientUpdateIntervals.get(ws) || 0;
   const currentTime = Date.now();
 
   let modifiedData, parsedValue;
@@ -261,6 +275,10 @@ function handleData(ws, receivedData) {
   
   for (const receivedLine of receivedLines) {
     switch (true) {
+      case receivedLine.startsWith('F'): // Bandwidth
+        initialData.bw = receivedLine.substring(1);
+        dataToSend.bw = receivedLine.substring(1);
+        break;
       case receivedLine.startsWith('P'): // PI Code
         modifiedData = receivedLine.slice(1);
         legacyRdsPiBuffer = modifiedData;
@@ -287,6 +305,11 @@ function handleData(ws, receivedData) {
           initialData.freq = (parsedValue / 1000).toFixed(3);
           dataToSend.freq = (parsedValue / 1000).toFixed(3);
           dataToSend.pi = '?';
+          dataToSend.txInfo.reg = false;
+
+          rdsWss.clients.forEach((client) => {
+            client.send("G:\r\nRESET-------\r\n\r\n");
+          });
         }
         break;
       case receivedLine.startsWith('Z'): // Antenna
@@ -347,33 +370,130 @@ function handleData(ws, receivedData) {
           modifiedData += errorsNew.toString(16).padStart(2, '0');
         }
 
+        rdsWss.clients.forEach((client) => {
+          let dataString = modifiedData.toString();
+          let lastTwoChars = dataString.slice(-2);
+          let lastByteValue = parseInt(lastTwoChars, 16);
+
+          let truncatedString = dataString.slice(0, -2);
+
+          if ((lastByteValue & 0x03) !== 0) {
+            truncatedString = truncatedString.slice(0, 4) + '----' + truncatedString.slice(8);
+          }
+
+          if ((lastByteValue & 0x30) !== 0) {
+            truncatedString = truncatedString.slice(0, 8) + '----' + truncatedString.slice(12);
+          }
+
+          if ((lastByteValue & 0x0C) !== 0) {
+            truncatedString = truncatedString.slice(0, 12) + '----';
+          }
+
+          let newDataString = "G:\r\n" + truncatedString + "\r\n\r\n";
+
+          let finalBuffer = Buffer.from(newDataString, 'utf-8');
+
+          client.send(finalBuffer);
+        });
+
         rdsparser.parse_string(rds, modifiedData);
         legacyRdsPiBuffer = null;
         break;
     }
   }
-
-  // Get the received TX info
-  const currentTx = fetchTx(parseFloat(dataToSend.freq).toFixed(1), dataToSend.pi, dataToSend.ps);
-  if(currentTx && currentTx.station !== undefined) {
-    dataToSend.txInfo = {
-      station: currentTx.station,
-      pol: currentTx.pol,
-      erp: currentTx.erp,
-      city: currentTx.city,
-      itu: currentTx.itu,
-      distance: currentTx.distance,
-      azimuth: currentTx.azimuth
-    }
+  
+  // Function to check internet connectivity
+  function isOnline(callback) {
+    dns.lookup('fmdx.org', (err) => {
+        if (err) {
+            callback(false); // No internet connection
+        } else {
+            callback(true); // Internet connection is available
+        }
+    });
   }
+
+  // Example usage in your function
+  isOnline((online) => {
+    if (online) {
+        // Get the received TX info
+        fetchTx(parseFloat(dataToSend.freq).toFixed(1), dataToSend.pi, dataToSend.ps)
+            .then((currentTx) => {
+                if (currentTx && currentTx.station !== undefined) {
+                    dataToSend.txInfo = {
+                        tx: currentTx.station,
+                        pol: currentTx.pol,
+                        erp: currentTx.erp,
+                        city: currentTx.city,
+                        itu: currentTx.itu,
+                        dist: currentTx.distance,
+                        azi: currentTx.azimuth,
+                        id: currentTx.id,
+                        pi: currentTx.pi,
+                        reg: currentTx.reg
+                    };
+                }
+            })
+            .catch((error) => {
+                logError("Error fetching Tx info:", error);
+            });
+
+        // Log only if the connection is restored and not already logged
+        if (!internetConnectionOn) {
+            logInfo("Internet connection is available.");
+            internetConnectionOn = true; // Set to prevent further logs
+            internetConnectionOff = false; // Reset the disconnection flag
+        }
+    } else {
+        // Log only if the connection is lost and not already logged
+        if (!internetConnectionOff) {
+            logError("No internet connection.");
+            internetConnectionOff = true; // Set to prevent further logs
+            internetConnectionOn = false; // Reset the connection flag
+        }
+    }
+  });
+
 
     // Send the updated data to the client
     const dataToSendJSON = JSON.stringify(dataToSend);
     if (currentTime - lastUpdateTime >= updateInterval) {
-      clientUpdateIntervals.set(ws, currentTime); // Update the last update time for this client
-      ws.send(dataToSendJSON);
+      wss.clients.forEach((client) => {
+          client.send(dataToSendJSON);
+      });
+      lastUpdateTime = Date.now();
+      serialportUpdateTime = process.hrtime();
     }
 }
+
+// Serialport retry code when port is open but communication is lost (additional code in index.js)
+isSerialportAlive = true;
+lastFrequencyAlive = '87.500';
+setInterval(() => {
+  lastFrequencyAlive = initialData.freq;
+  const serialportElapsedTime = process.hrtime(serialportUpdateTime)[0];
+  // Activate serialport retry if handleData has not been executed for over 8 seconds
+  if (checkSerialport && (serialportElapsedTime > 8) && !isSerialportRetrying && serverConfig.xdrd.wirelessConnection === false) {
+    isSerialportAlive = false;
+    isSerialportRetrying = true;
+  }
+}, 2000);
+
+// Delay checking Serialport status on startup for 10 seconds
+async function checkSerialPortStatus() {
+    const ServerStartTime = process.hrtime();
+
+    while (!checkSerialport) {
+        const ServerElapsedSeconds = process.hrtime(ServerStartTime)[0];
+
+        if (ServerElapsedSeconds > 10) {
+            checkSerialport = true;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+}
+checkSerialPortStatus();
 
 function showOnlineUsers(currentUsers) {
   dataToSend.users = currentUsers;
@@ -384,20 +504,22 @@ function processSignal(receivedData, st, stForced) {
   const modifiedData = receivedData.substring(2);
   const parsedValue = parseFloat(modifiedData);
   dataToSend.st = st;
-  dataToSend.st_forced = stForced;
+  dataToSend.stForced = stForced;
   initialData.st = st;
-  initialData.st_forced = stForced;
+  initialData.stForced = stForced;
 
   if (!isNaN(parsedValue)) {
     // Convert parsedValue to a number
     var signal = parseFloat(parsedValue.toFixed(2));
-    dataToSend.signal = signal;
-    initialData.signal = signal;
+    dataToSend.sig = signal;
+    initialData.sig = signal;
+    dataToSend.sigRaw = receivedData;
+    initialData.sigRaw = receivedData;
 
     // Convert highestSignal to a number for comparison
-    var highestSignal = parseFloat(dataToSend.highestSignal);
+    var highestSignal = parseFloat(dataToSend.sigTop);
     if (signal > highestSignal) {
-        dataToSend.highestSignal = signal.toString(); // Convert back to string for consistency
+        dataToSend.sigTop = signal.toString(); // Convert back to string for consistency
     }
 }
 
